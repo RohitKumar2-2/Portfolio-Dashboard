@@ -1,13 +1,13 @@
 """
 Streamlit Portfolio Comparison Dashboard
 Reads any number of CSV portfolio files and produces:
-- Common and unique stocks (back in!)
-- Alerts (red/green) per rules described by the user
-- Key highlights: max capital in one stock, top 3 losses
-- Interactive, polished UI with rich visuals
+- Common and unique stocks
+- Alerts (Yellow/Red/Green) per rules described by the user
+- Key highlights (portfolio-wise): max capital, max profit, max loss
+- Interactive UI with rich visuals
 
 Usage:
-    streamlit run streamlit_portfolio_dashboard.py
+    streamlit run app.py
 """
 
 import streamlit as st
@@ -23,9 +23,6 @@ st.set_page_config(page_title="Portfolio Comparator", layout="wide", page_icon="
 # ------------------ Helpers ------------------
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize column names and coerce types; fill any missing core columns.
-    Accepts common name variations.
-    """
     col_map = {}
     lower = {c.lower().strip(): c for c in df.columns}
     mapping = {
@@ -47,11 +44,9 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.rename(columns=col_map)
     if 'instrument' not in df.columns:
         df = df.rename(columns={df.columns[0]: 'instrument'})
-    # ensure columns exist
     for col in ['qty','avg_cost','ltp','invested','cur_val','pl','net_chg','day_chg']:
         if col not in df.columns:
             df[col] = 0
-    # coerce numerics
     for num_col in ['qty','avg_cost','ltp','invested','cur_val','pl','net_chg','day_chg']:
         df[num_col] = (df[num_col]
                        .astype(str)
@@ -66,7 +61,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def aggregate_portfolios(dfs: Dict[str,pd.DataFrame]) -> pd.DataFrame:
-    """Aggregate across portfolios by instrument."""
     rows = []
     for name, df in dfs.items():
         tmp = df.copy()
@@ -91,7 +85,6 @@ def aggregate_portfolios(dfs: Dict[str,pd.DataFrame]) -> pd.DataFrame:
 
 
 def compute_common_unique(dfs: Dict[str, pd.DataFrame]) -> Tuple[List[str], Dict[str, List[str]]]:
-    """Return (common across ALL portfolios, unique per portfolio)."""
     names = list(dfs.keys())
     sets = {n: set(dfs[n]['instrument'].dropna().unique()) for n in names}
     if not sets:
@@ -116,7 +109,6 @@ def rupees(x: float) -> str:
 
 def generate_alerts(
     dfs: Dict[str, pd.DataFrame],
-    agg: pd.DataFrame,
     common_list: List[str],
     unique_per: Dict[str, List[str]],
     *,
@@ -129,7 +121,6 @@ def generate_alerts(
     profit_large_pct: float = 6.0,
     profit_large_amt: float = 100000.0,
 ) -> pd.DataFrame:
-    """Build alerts per the rules; return as DataFrame."""
     alerts = []
     # Unique stock opportunity (down more than 5%)
     for port, uniques in unique_per.items():
@@ -143,7 +134,7 @@ def generate_alerts(
             pl_pct = (pl / invested * 100) if invested else 0
             if pl_pct < -uniq_loss_thresh:
                 alerts.append({
-                    'category': 'Red',
+                    'category': 'Yellow',
                     'type': 'Opportunity (Unique - down >5%)',
                     'instrument': ins,
                     'message': f"Opportunity: Add {ins} to other portfolios. It's down {round(-pl_pct,2)}% with {rupees(invested)} invested.",
@@ -152,64 +143,65 @@ def generate_alerts(
                     'pl_pct': pl_pct,
                     'rule': f"unique & loss>{uniq_loss_thresh}%"
                 })
-    # Common stocks average out rules
+    # Average Out (portfolio-wise, only for common stocks)
     common_set = set(common_list)
-    for ins in common_set:
-        row = agg[agg['instrument'] == ins]
-        if row.empty:
-            continue
-        invested = float(row['total_invested'].iloc[0])
-        pl = float(row['total_pl'].iloc[0])
-        loss_pct = (pl / invested * 100) if invested else 0
-        if loss_pct < -common_small_loss and invested < small_amt:
-            alerts.append({
-                'category': 'Red',
-                'type': 'Average Out (Small Invest)',
-                'instrument': ins,
-                'message': f"Average Out (small): {ins} is down {round(-loss_pct,2)}% with total invested {rupees(invested)} (< {rupees(small_amt)}).",
-                'portfolio': 'ALL',
-                'invested': invested,
-                'pl_pct': loss_pct,
-                'rule': f"common & loss>{common_small_loss}% & invested<{rupees(small_amt)}"
-            })
-        if loss_pct < -common_large_loss and invested > large_amt:
-            alerts.append({
-                'category': 'Red',
-                'type': 'Average Out (Large Invest)',
-                'instrument': ins,
-                'message': f"Average Out (large): {ins} is down {round(-loss_pct,2)}% with total invested {rupees(invested)} (> {rupees(large_amt)}).",
-                'portfolio': 'ALL',
-                'invested': invested,
-                'pl_pct': loss_pct,
-                'rule': f"common & loss>{common_large_loss}% & invested>{rupees(large_amt)}"
-            })
-    # Book profit rules
-    for _, r in agg.iterrows():
-        ins = r['instrument']
-        invested = float(r['total_invested'])
-        pl_pct = float(r['pl_pct']) if not pd.isna(r['pl_pct']) else 0
-        if pl_pct > profit_small_pct and invested < profit_large_amt:
-            alerts.append({
-                'category': 'Green',
-                'type': 'Book Profit (Small)',
-                'instrument': ins,
-                'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} (< {rupees(profit_large_amt)}).",
-                'portfolio': 'ALL',
-                'invested': invested,
-                'pl_pct': pl_pct,
-                'rule': f"profit>{profit_small_pct}% & invested<{rupees(profit_large_amt)}"
-            })
-        if pl_pct > profit_large_pct and invested > profit_large_amt:
-            alerts.append({
-                'category': 'Green',
-                'type': 'Book Profit (Large)',
-                'instrument': ins,
-                'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} (> {rupees(profit_large_amt)}).",
-                'portfolio': 'ALL',
-                'invested': invested,
-                'pl_pct': pl_pct,
-                'rule': f"profit>{profit_large_pct}% & invested>{rupees(profit_large_amt)}"
-            })
+    for port, df in dfs.items():
+        for ins in set(df['instrument']).intersection(common_set):
+            r = df[df['instrument'] == ins]
+            invested = float(r['invested'].sum())
+            pl = float(r['pl'].sum())
+            loss_pct = (pl / invested * 100) if invested else 0
+            if loss_pct < -common_small_loss and invested < small_amt:
+                alerts.append({
+                    'category': 'Red',
+                    'type': 'Average Out (Small Invest)',
+                    'instrument': ins,
+                    'message': f"Average Out (small): {ins} is down {round(-loss_pct,2)}% with invested {rupees(invested)} in {port}.",
+                    'portfolio': port,
+                    'invested': invested,
+                    'pl_pct': loss_pct,
+                    'rule': f"loss>{common_small_loss}% & invested<{rupees(small_amt)}"
+                })
+            if loss_pct < -common_large_loss and invested > large_amt:
+                alerts.append({
+                    'category': 'Red',
+                    'type': 'Average Out (Large Invest)',
+                    'instrument': ins,
+                    'message': f"Average Out (large): {ins} is down {round(-loss_pct,2)}% with invested {rupees(invested)} in {port}.",
+                    'portfolio': port,
+                    'invested': invested,
+                    'pl_pct': loss_pct,
+                    'rule': f"loss>{common_large_loss}% & invested>{rupees(large_amt)}"
+                })
+    # Book profit rules (portfolio-wise)
+    for port, df in dfs.items():
+        for _, r in df.iterrows():
+            ins = r['instrument']
+            invested = float(r['invested'])
+            pl = float(r['pl'])
+            pl_pct = (pl / invested * 100) if invested else 0
+            if pl_pct > profit_small_pct and invested < profit_large_amt:
+                alerts.append({
+                    'category': 'Green',
+                    'type': 'Book Profit (Small)',
+                    'instrument': ins,
+                    'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} in {port}.",
+                    'portfolio': port,
+                    'invested': invested,
+                    'pl_pct': pl_pct,
+                    'rule': f"profit>{profit_small_pct}% & invested<{rupees(profit_large_amt)}"
+                })
+            if pl_pct > profit_large_pct and invested > profit_large_amt:
+                alerts.append({
+                    'category': 'Green',
+                    'type': 'Book Profit (Large)',
+                    'instrument': ins,
+                    'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} in {port}.",
+                    'portfolio': port,
+                    'invested': invested,
+                    'pl_pct': pl_pct,
+                    'rule': f"profit>{profit_large_pct}% & invested>{rupees(profit_large_amt)}"
+                })
     if not alerts:
         return pd.DataFrame(columns=['category','type','instrument','message','portfolio','invested','pl_pct','rule'])
     return pd.DataFrame(alerts).sort_values(['category','type','instrument']).reset_index(drop=True)
@@ -226,14 +218,13 @@ st.markdown("""
     .alert-card { padding: 12px 14px; border-radius: 10px; margin-bottom: 10px; font-size: 0.95rem; }
     .red-flag { background-color: #ffeaea; border-left: 6px solid #e74c3c; }
     .green-flag { background-color: #e9fff1; border-left: 6px solid #2ecc71; }
+    .yellow-flag { background-color: #fff8e1; border-left: 6px solid #f1c40f; }
     .info-flag { background-color: #eaf2ff; border-left: 6px solid #3498db; }
     .chip { display:inline-block; padding:4px 10px; border-radius:999px; margin:2px; background:#eef2f7; }
 </style>
 """, unsafe_allow_html=True)
 
-
-
-# Sidebar controls for interactivity
+# Sidebar
 with st.sidebar:
     st.header("⚙️ Alert Rules")
     uniq_loss_thresh = st.number_input("Unique loss threshold (%)", value=5.0, min_value=0.0, step=0.5)
@@ -274,19 +265,33 @@ if uploaded:
                 for name, uniqs in unique_per.items():
                     st.write(f"**{name}** ({len(uniqs)})")
                     if uniqs:
-                        st.markdown(' '.join([f"<span class='chip'>{u}</span>" for u in uniqs[:50]]), unsafe_allow_html=True)
+                        chips_html = []
+                        df = dfs[name]
+                        for u in uniqs[:50]:
+                            row = df[df['instrument'] == u]
+                            if not row.empty:
+                                invested = float(row['invested'].sum())
+                                pl = float(row['pl'].sum())
+                                pl_pct = (pl / invested * 100) if invested else 0
+                                color = "green" if pl_pct > 0 else "red"
+                                chips_html.append(
+                                    f"<span class='chip' style='color:{color};font-weight:bold'>{u} ({pl_pct:.2f}%)</span>"
+                                )
+                            else:
+                                chips_html.append(f"<span class='chip'>{u}</span>")
+                        st.markdown(' '.join(chips_html), unsafe_allow_html=True)
                         if len(uniqs) > 50:
                             st.caption(f"(+{len(uniqs)-50} more)")
                     else:
                         st.caption("None")
 
-        # Aggregate for further logic
+        # Aggregate
         agg = aggregate_portfolios(dfs)
 
-        # Alerts Section (with filters)
+        # Alerts
         st.subheader("🚨 Alerts & Opportunities")
         alerts_df = generate_alerts(
-            dfs, agg, common_list, unique_per,
+            dfs, common_list, unique_per,
             uniq_loss_thresh=uniq_loss_thresh,
             common_small_loss=common_small_loss,
             common_large_loss=common_large_loss,
@@ -309,9 +314,8 @@ if uploaded:
             if typ:
                 view = view[view['type'].isin(typ)]
 
-            # Render nice cards
             for _, r in view.iterrows():
-                css_class = 'green-flag' if r['category'] == 'Green' else 'red-flag'
+                css_class = 'green-flag' if r['category'] == 'Green' else ('yellow-flag' if r['category'] == 'Yellow' else 'red-flag')
                 st.markdown(
                     f"""
                     <div class='alert-card {css_class}'>
@@ -330,15 +334,28 @@ if uploaded:
         else:
             st.markdown('<div class="alert-card info-flag">No alerts triggered based on the rules.</div>', unsafe_allow_html=True)
 
-        # Highlights
-        with st.expander("⭐ Key Highlights", expanded=True):
-            if not agg.empty:
-                max_row = agg.loc[agg['total_invested'].idxmax()]
-                st.markdown(f"**Max Capital in One Stock:** {max_row['instrument']} — {rupees(max_row['total_invested'])}")
-                losses = agg.sort_values('pl_pct').head(3)
-                st.markdown("**Top 3 Stocks with Biggest Losses (by %)**")
-                for _, r in losses.iterrows():
-                    st.write(f"{r['instrument']}: {r['pl_pct']:.2f}% (Invested {rupees(r['total_invested'])})")
+        # Portfolio-wise Highlights
+        with st.expander("⭐ Key Highlights (Portfolio-wise)", expanded=True):
+            sel_port = st.selectbox("Select portfolio", options=list(dfs.keys()))
+            dfp = dfs[sel_port].copy()
+
+            if not dfp.empty:
+                st.markdown("**🏆 Top 3 Max Capital Stocks**")
+                top_cap = dfp.sort_values('invested', ascending=False).head(3)
+                for _, r in top_cap.iterrows():
+                    st.write(f"{r['instrument']}: Invested {rupees(r['invested'])}")
+
+                st.markdown("**💰 Top 3 Max Profit Stocks**")
+                top_profit = dfp.sort_values('pl', ascending=False).head(3)
+                for _, r in top_profit.iterrows():
+                    pct = (r['pl']/r['invested']*100 if r['invested'] else 0)
+                    st.write(f"{r['instrument']}: Profit {rupees(r['pl'])} ({pct:.2f}%)")
+
+                st.markdown("**📉 Top 3 Max Loss Stocks**")
+                top_loss = dfp.sort_values('pl').head(3)
+                for _, r in top_loss.iterrows():
+                    pct = (r['pl']/r['invested']*100 if r['invested'] else 0)
+                    st.write(f"{r['instrument']}: Loss {rupees(r['pl'])} ({pct:.2f}%)")
 
         # Visualizations
         st.subheader("📊 Visualizations")
@@ -371,7 +388,6 @@ if uploaded:
             st.plotly_chart(treemap, use_container_width=True)
 
         with tab4:
-            # Presence matrix (instrument x portfolio)
             names = list(dfs.keys())
             presence_rows = []
             for ins in agg['instrument']:
@@ -380,7 +396,6 @@ if uploaded:
                     row[n] = 1 if ins in set(dfs[n]['instrument']) else 0
                 presence_rows.append(row)
             presence = pd.DataFrame(presence_rows)
-            # limit to top 30 by invested for readability
             top30 = agg[['instrument','total_invested']].sort_values('total_invested', ascending=False).head(30)
             mat = presence.merge(top30, on='instrument', how='inner').drop(columns=['total_invested'])
             heat = go.Figure(data=go.Heatmap(
@@ -393,13 +408,11 @@ if uploaded:
             heat.update_layout(title="Overlap Matrix — 1 means present in portfolio", xaxis_nticks=len(names))
             st.plotly_chart(heat, use_container_width=True)
 
-        # Drilldown
         with st.expander("🔎 Per-Portfolio Drilldown"):
-            sel = st.selectbox("Select portfolio", options=list(dfs.keys()))
+            sel = st.selectbox("Select portfolio for drilldown", options=list(dfs.keys()))
             st.dataframe(dfs[sel])
 
 else:
     st.info("Upload one or more CSV portfolio files to get started.")
 
 st.markdown("---")
-
