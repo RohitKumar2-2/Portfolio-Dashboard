@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+.env/
+.env
+*.env
+
+# Secrets / tokens
+zerodha_token.json
+*.log
+logs/
+
+# Streamlit cache
+.streamlit/
+.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
