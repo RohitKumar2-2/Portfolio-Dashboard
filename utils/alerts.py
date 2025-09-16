@@ -1,275 +1,150 @@
 import pandas as pd
-from utils.helpers import rupees
+from typing import Dict, List
 
-# ---------- Normalizer ----------
-def normalize_symbol(s: str) -> str:
-    """Standardize stock symbols for matching across portfolios."""
-    if not isinstance(s, str):
-        return s
-    return s.strip().upper().replace(".NS", "")
+# New rule-driven alert engine.
+# valid_dfs: { portfolio_name: DataFrame(instrument, pnl_pct, invested, ...) }
+# alert_rules: list of dicts (stored in st.session_state.alert_rules)
+#
+# Rule fields used:
+#  name, applied_to(list), uni_common("Unique"/"Common"), common_in(list),
+#  profit_loss("Profit"/"Loss"/"Unchanged"), pl_comp("Greater Than"/"Less Than"/"Range"),
+#  pl_from(float), pl_to(float), inv_comp(...), inv_from(float), inv_to(float), message(str)
 
-def _extract_pl_context(row):
-    """
-    Returns dict with:
-      invested, pl_abs, pl_pct
-    Accepts multiple possible schemas.
-    """
-    # Invested
-    invested = (
-        row.get("invested")
-        or row.get("Invested")
-        or ( (row.get("avg_price") or row.get("average_price") or 0) * (row.get("quantity") or row.get("qty") or 0) )
-        or 0
-    )
-    # Absolute P&L
-    pl_abs = (
-        row.get("pl")
-        or row.get("P&L")
-        or row.get("pnl_abs")
-    )
-    if pl_abs is None:
-        avg = row.get("avg_price") or row.get("average_price")
-        ltp = row.get("ltp") or row.get("LTP") or row.get("last_price")
-        qty = row.get("quantity") or row.get("qty") or 0
-        if avg is not None and ltp is not None:
-            try:
-                pl_abs = (ltp - avg) * qty
-            except Exception:
-                pl_abs = 0
-        else:
-            pl_abs = 0
+def generate_alerts(valid_dfs: Dict[str, pd.DataFrame], alert_rules: List[dict]) -> pd.DataFrame:
+    if not valid_dfs or not alert_rules:
+        return pd.DataFrame(columns=["instrument","portfolio","rule","message","category"])
+    # Precompute instrument sets
+    inst_sets = {p: set(df["instrument"].dropna().unique()) for p, df in valid_dfs.items()}
+    all_ports = list(valid_dfs.keys())
 
-    # Percentage P&L
-    pl_pct = row.get("pnl_pct")
-    if pl_pct is None:
-        if invested:
-            pl_pct = (pl_abs / invested) * 100 if invested else 0
-        else:
-            pl_pct = 0
+    records = []
 
-    return {
-        "invested": float(invested) if invested else 0.0,
-        "pl_abs": float(pl_abs) if pl_abs else 0.0,
-        "pl_pct": float(pl_pct) if pl_pct else 0.0
-    }
-
-# ---------- Alerts ----------
-def generate_alerts(
-    dfs: dict,
-    common_list: list,
-    unique_per: dict,
-    *,
-    uniq_loss_thresh: float = 5.0,
-    common_small_loss: float = 5.0,
-    common_large_loss: float = 7.0,
-    small_amt: float = 100000.0,
-    large_amt: float = 150000.0,
-    profit_small_pct: float = 10.0,
-    profit_large_pct: float = 6.0,
-    profit_large_amt: float = 100000.0,
-) -> pd.DataFrame:
-    """
-    Generate portfolio-wise alerts based on rules.
-
-    Returns:
-        pd.DataFrame with columns:
-        ['category','type','instrument','message','portfolio','invested','pl_pct','rule']
-    """
-    alerts = []
-
-    # ---------- Normalize instruments in all dfs ----------
-    dfs = {
-        port: df.rename(columns=str.lower).assign(
-            instrument=df['instrument'].apply(normalize_symbol)
-        )
-        for port, df in dfs.items()
-    }
-
-    # Normalize unique & common lists
-    common_list = [normalize_symbol(x) for x in common_list]
-    unique_per = {p: [normalize_symbol(x) for x in lst] for p, lst in unique_per.items()}
-
-    # ------------------ Unique Stock Opportunities ------------------
-    for port, uniques in unique_per.items():
-        df = dfs[port]
-        for ins in uniques:
-            r = df[df['instrument'] == ins]
-            if r.empty:
-                continue
-            invested = float(r['invested'].sum())
-            pl = float(r['pl'].sum())
-            pl_pct = (pl / invested * 100) if invested else 0
-            if pl_pct < -uniq_loss_thresh:
-                alerts.append({
-                    'category': 'Yellow',
-                    'type': 'Opportunity (Unique - down > threshold)',
-                    'instrument': ins,
-                    'message': f"Opportunity: Add {ins} to other portfolios. It's down {round(pl_pct,2)}% with {rupees(invested)} invested.",
-                    'portfolio': port,
-                    'invested': invested,
-                    'pl_pct': pl_pct,
-                    'rule': f"unique & loss>{uniq_loss_thresh}%"
-                })
-
-    # ------------------ Average Out (Common Stocks) ------------------
-    common_set = set(common_list)
-    for port, df in dfs.items():
-        for ins in set(df['instrument']).intersection(common_set):
-            r = df[df['instrument'] == ins]
-            invested = float(r['invested'].sum())
-            pl = float(r['pl'].sum())
-            loss_pct = (pl / invested * 100) if invested else 0
-            if loss_pct < -common_small_loss and invested < small_amt:
-                alerts.append({
-                    'category': 'Red',
-                    'type': 'Average Out (Small Invest)',
-                    'instrument': ins,
-                    'message': f"Average Out (small): {ins} is down {round(loss_pct,2)}% with invested {rupees(invested)} in {port}.",
-                    'portfolio': port,
-                    'invested': invested,
-                    'pl_pct': loss_pct,
-                    'rule': f"loss>{common_small_loss}% & invested<{rupees(small_amt)}"
-                })
-            if loss_pct < -common_large_loss and invested > large_amt:
-                alerts.append({
-                    'category': 'Red',
-                    'type': 'Average Out (Large Invest)',
-                    'instrument': ins,
-                    'message': f"Average Out (large): {ins} is down {round(loss_pct,2)}% with invested {rupees(invested)} in {port}.",
-                    'portfolio': port,
-                    'invested': invested,
-                    'pl_pct': loss_pct,
-                    'rule': f"loss>{common_large_loss}% & invested>{rupees(large_amt)}"
-                })
-
-    # ------------------ Book Profit ------------------
-    for port, df in dfs.items():
-        for _, r in df.iterrows():
-            ins = r['instrument']
-            invested = float(r['invested'])
-            pl = float(r['pl'])
-            pl_pct = (pl / invested * 100) if invested else 0
-            if pl_pct > profit_small_pct and invested < profit_large_amt:
-                alerts.append({
-                    'category': 'Green',
-                    'type': 'Book Profit (Small)',
-                    'instrument': ins,
-                    'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} in {port}.",
-                    'portfolio': port,
-                    'invested': invested,
-                    'pl_pct': pl_pct,
-                    'rule': f"profit>{profit_small_pct}% & invested<{rupees(profit_large_amt)}"
-                })
-            if pl_pct > profit_large_pct and invested > profit_large_amt:
-                alerts.append({
-                    'category': 'Green',
-                    'type': 'Book Profit (Large)',
-                    'instrument': ins,
-                    'message': f"Book Profit: {ins} is up {round(pl_pct,2)}% with invested {rupees(invested)} in {port}.",
-                    'portfolio': port,
-                    'invested': invested,
-                    'pl_pct': pl_pct,
-                    'rule': f"profit>{profit_large_pct}% & invested>{rupees(profit_large_amt)}"
-                })
-
-    # ------------------ Return as DataFrame ------------------
-    if not alerts:
-        return pd.DataFrame(columns=['category','type','instrument','message','portfolio','invested','pl_pct','rule'])
-
-    return pd.DataFrame(alerts).sort_values(
-        ['category','type','instrument']
-    ).reset_index(drop=True)
-
-    # ---------- Alerts ----------
-def generate_alerts(
-    dfs: dict,
-    common_list: list,
-    unique_per: dict,
-    *,
-    uniq_loss_thresh: float = 5.0,
-    common_small_loss: float = 5.0,
-    common_large_loss: float = 7.0,
-    small_amt: float = 100000.0,
-    large_amt: float = 150000.0,
-    profit_small_pct: float = 10.0,
-    profit_large_pct: float = 6.0,
-    profit_large_amt: float = 100000.0,
-) -> pd.DataFrame:
-    """
-    Robust alert generator that no longer assumes 'pl' column.
-    """
-    alerts = []
-
-    for pname, df in dfs.items():
-        if df.empty:
+    for rule in alert_rules:
+        applied = rule.get("applied_to") or all_ports  # empty => all
+        applied = [p for p in applied if p in valid_dfs]  # safety
+        if not applied:
             continue
 
-        for _, r in df.iterrows():
-            symbol = r.get("instrument") or r.get("symbol") or r.get("tradingsymbol")
-            if not symbol:
-                continue
+        scope = rule.get("uni_common","Unique")
+        profit_loss = rule.get("profit_loss","Loss")
+        pl_comp = rule.get("pl_comp","Greater Than")
+        pl_from = float(rule.get("pl_from",0) or 0)
+        pl_to = float(rule.get("pl_to",pl_from))
+        inv_comp = rule.get("inv_comp","Greater Than")
+        inv_from = float(rule.get("inv_from",0) or 0)
+        inv_to = float(rule.get("inv_to",inv_from))
+        message = rule.get("message", rule.get("name","Alert"))
+        rule_name = rule.get("name","Alert")
 
-            ctx = _extract_pl_context(r)
-            invested = ctx["invested"]
-            pl_abs = ctx["pl_abs"]
-            pl_pct = ctx["pl_pct"]
-
-            # Determine common / unique
-            is_common = symbol in common_list
-
-            # Loss scenarios
-            if pl_pct < 0:
-                loss_pct = abs(pl_pct)
-
-                # Unique stock loss alert
-                if (not is_common) and loss_pct >= uniq_loss_thresh:
-                    alerts.append({
-                        "instrument": symbol,
-                        "portfolio": pname,
-                        "category": "Red" if invested >= large_amt else "Yellow",
-                        "rule": f"Unique loss >= {uniq_loss_thresh}%",
-                        "message": f"Unique holding down {loss_pct:.2f}% (₹{pl_abs:.0f})"
+        # Determine candidate symbols per portfolio based on Unique/Common
+        if scope == "Common":
+            subset = rule.get("common_in") or applied
+            subset = [p for p in subset if p in applied]
+            if not subset:
+                subset = applied
+            common_syms = set.intersection(*[inst_sets[p] for p in subset]) if subset else set()
+            # We'll alert once per portfolio in 'subset' for each symbol (so user sees portfolio context)
+            for p in subset:
+                dfp = valid_dfs[p]
+                part = dfp[dfp["instrument"].isin(common_syms)].copy()
+                part = _apply_pl_filters(part, profit_loss, pl_comp, pl_from, pl_to)
+                part = _apply_inv_filters(part, inv_comp, inv_from, inv_to)
+                if part.empty:
+                    continue
+                cat = _derive_category(profit_loss)
+                for _, r in part.iterrows():
+                    records.append({
+                        "instrument": r["instrument"],
+                        "portfolio": p,
+                        "rule": rule_name,
+                        "message": message,
+                        "category": cat
+                    })
+        else:  # Unique
+            # Unique within 'applied'
+            union_applied = {p: inst_sets[p] for p in applied}
+            for p in applied:
+                others = set().union(*[union_applied[o] for o in applied if o != p])
+                unique_syms = inst_sets[p] - others
+                if not unique_syms:
+                    continue
+                dfp = valid_dfs[p]
+                part = dfp[dfp["instrument"].isin(unique_syms)].copy()
+                part = _apply_pl_filters(part, profit_loss, pl_comp, pl_from, pl_to)
+                part = _apply_inv_filters(part, inv_comp, inv_from, inv_to)
+                if part.empty:
+                    continue
+                cat = _derive_category(profit_loss)
+                for _, r in part.iterrows():
+                    records.append({
+                        "instrument": r["instrument"],
+                        "portfolio": p,
+                        "rule": rule_name,
+                        "message": message,
+                        "category": cat
                     })
 
-                # Common stock – scale thresholds
-                if is_common:
-                    if loss_pct >= common_large_loss:
-                        alerts.append({
-                            "instrument": symbol,
-                            "portfolio": pname,
-                            "category": "Red",
-                            "rule": f"Common loss >= {common_large_loss}%",
-                            "message": f"Common holding heavy loss {loss_pct:.2f}%"
-                        })
-                    elif loss_pct >= common_small_loss:
-                        alerts.append({
-                            "instrument": symbol,
-                            "portfolio": pname,
-                            "category": "Yellow",
-                            "rule": f"Common loss >= {common_small_loss}%",
-                            "message": f"Common holding moderate loss {loss_pct:.2f}%"
-                        })
+    if not records:
+        return pd.DataFrame(columns=["instrument","portfolio","rule","message","category"])
+    out = pd.DataFrame(records).drop_duplicates()
+    # Optional ordering
+    cat_order = {"Red":0,"Yellow":1,"Green":2}
+    out["__order"] = out["category"].map(cat_order).fillna(99)
+    out = out.sort_values(["__order","portfolio","instrument"]).drop(columns="__order")
+    return out
 
-            # Profit booking
-            if pl_pct > 0:
-                if invested >= large_amt and pl_pct >= profit_large_pct:
-                    alerts.append({
-                        "instrument": symbol,
-                        "portfolio": pname,
-                        "category": "Green",
-                        "rule": f"Large invest profit >= {profit_large_pct}%",
-                        "message": f"Large position up {pl_pct:.2f}% (₹{pl_abs:.0f})"
-                    })
-                elif invested < large_amt and pl_pct >= profit_small_pct:
-                    alerts.append({
-                        "instrument": symbol,
-                        "portfolio": pname,
-                        "category": "Green",
-                        "rule": f"Small invest profit >= {profit_small_pct}%",
-                        "message": f"Up {pl_pct:.2f}% (₹{pl_abs:.0f})"
-                    })
 
-    if not alerts:
-        return pd.DataFrame(columns=["instrument","portfolio","category","rule","message"])
+def _apply_pl_filters(df: pd.DataFrame, direction: str, comp: str, v_from: float, v_to: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "pnl_pct" not in df.columns:
+        return df.iloc[0:0]
+    # Unchanged: near zero (abs <= 0.0001)
+    if direction == "Unchanged":
+        return df[ df["pnl_pct"].abs() <= 0.0001 ]
 
-    return pd.DataFrame(alerts)
+    sign_mask = df["pnl_pct"] > 0 if direction == "Profit" else df["pnl_pct"] < 0
+    work = df[sign_mask].copy()
+    if work.empty:
+        return work
+
+    # Comparator applied on value (profit) or abs(value) (loss) for intuitive thresholds
+    if direction == "Loss":
+        val = work["pnl_pct"].abs()
+    else:
+        val = work["pnl_pct"]
+
+    if comp == "Greater Than":
+        work = work[val >= v_from]
+    elif comp == "Less Than":
+        work = work[val <= v_from]
+    elif comp == "Range":
+        lo = min(v_from, v_to)
+        hi = max(v_from, v_to)
+        work = work[(val >= lo) & (val <= hi)]
+    return work
+
+
+def _apply_inv_filters(df: pd.DataFrame, comp: str, v_from: float, v_to: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if "invested" not in df.columns:
+        return df.iloc[0:0]
+    val = df["invested"]
+    if comp == "Greater Than":
+        return df[val >= v_from]
+    elif comp == "Less Than":
+        return df[val <= v_from]
+    elif comp == "Range":
+        lo = min(v_from, v_to)
+        hi = max(v_from, v_to)
+        return df[(val >= lo) & (val <= hi)]
+    return df
+
+
+def _derive_category(direction: str) -> str:
+    if direction == "Profit":
+        return "Green"
+    if direction == "Loss":
+        return "Red"
+    return "Yellow"

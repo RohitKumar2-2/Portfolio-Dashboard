@@ -11,6 +11,7 @@ from services.smartapi_service import (
     fetch_portfolio as fetch_angelone_portfolio,
     fetch_zerodha_portfolio
 )
+from kiteconnect import KiteConnect  # only needed if you add optional debug (else you can remove)
 
 load_dotenv()
 
@@ -43,22 +44,202 @@ zerodha_access_token = load_cached_zerodha_token(zerodha_access_token)
 st.set_page_config(page_title="WHALESTREET DASHBOARD | Portfolio Dashboard", layout="wide", page_icon="📊")
 st.title("📊 Portfolio Dashboard")
 
-# Sidebar Alert Rules
-with st.sidebar:
-    st.header("⚙️ Alert Rules")
-    uniq_loss_thresh = st.number_input("Unique loss threshold (%)", value=5.0, min_value=0.0, step=0.5)
-    common_small_loss = st.number_input("Common small loss (%)", value=5.0, min_value=0.0, step=0.5)
-    common_large_loss = st.number_input("Common large loss (%)", value=7.0, min_value=0.0, step=0.5)
-    small_amt = st.number_input("Small invest max (₹)", value=100000.0, step=5000.0)
-    large_amt = st.number_input("Large invest min (₹)", value=150000.0, step=5000.0)
-    profit_small_pct = st.number_input("Profit small (%)", value=10.0, min_value=0.0, step=0.5)
-    profit_large_pct = st.number_input("Profit large (%)", value=6.0, min_value=0.0, step=0.5)
+# ---------- New Dynamic Alert Rules UI & Mapping Layer ----------
 
-# Refresh
-if st.button("🔄 Refresh Portfolios"):
+# ---------- Dynamic Alert Rules (replacing previous version) ----------
+def _init_alert_rules():
+    if "alert_rules" not in st.session_state:
+        # Start with NO predefined rules
+        st.session_state.alert_rules = []
+    if "next_rule_id" not in st.session_state:
+        st.session_state.next_rule_id = 1
+    if "show_alert_rules_dialog" not in st.session_state:
+        st.session_state.show_alert_rules_dialog = False
+    if "editing_rule_id" not in st.session_state:
+        st.session_state.editing_rule_id = None
+
+_init_alert_rules()
+
+PL_COMP_OPTS = ["Greater Than","Less Than","Range"]
+
+def _alerts_css():
+    if "alerts_css_done" in st.session_state:
+        return
+    st.markdown("""
+    <style>
+    div[data-testid="stDialog"] > div {
+        width: 1050px !important;
+        max-width: 1050px !important;
+    }
+    div[data-testid="stDialog"] section {
+        max-height: 68vh !important;
+        overflow-y: auto !important;
+    }
+    .rule-row {padding:4px 6px;border-radius:4px;margin-bottom:4px;background:#fafafa;}
+    .rule-row:hover {background:#f0f2f6;}
+    .icon-btn button {padding:2px 6px !important; font-size:0.7rem !important; line-height:1 !important;}
+    </style>
+    """, unsafe_allow_html=True)
+    st.session_state.alerts_css_done = True
+
+_alerts_css()
+
+def open_alert_rules_dialog():
+    st.session_state.show_alert_rules_dialog = True
+    st.session_state.editing_rule_id = None
+
+def _close_alert_rules_dialog():
+    st.session_state.show_alert_rules_dialog = False
+    st.session_state.editing_rule_id = None
+
+def _start_edit_rule(rid:int):
+    st.session_state.editing_rule_id = rid
+
+def _add_rule():
+    rid = st.session_state.next_rule_id
+    st.session_state.alert_rules.append({
+        "id": rid, "name": f"Alert {rid}",
+        "applied_to": [], "uni_common":"Unique","common_in":[],
+        "profit_loss":"Loss","pl_comp":"Greater Than","pl_from":5.0,"pl_to":0.0,
+        "inv_comp":"Greater Than","inv_from":0.0,"inv_to":0.0,
+        "message":"New rule"
+    })
+    st.session_state.next_rule_id += 1
+    st.session_state.editing_rule_id = rid
+
+def _reset_rules():
+    """Delete all alert rules and reset counters."""
+    st.session_state.alert_rules = []
+    st.session_state.next_rule_id = 1
+    st.session_state.editing_rule_id = None
+
+def _delete_rule(rid:int):
+    st.session_state.alert_rules = [r for r in st.session_state.alert_rules if r["id"]!=rid]
+    if st.session_state.editing_rule_id == rid:
+        st.session_state.editing_rule_id = None
+
+def _save_rule(rid:int):
+    for r in st.session_state.alert_rules:
+        if r["id"] == rid:
+            r["name"] = st.session_state.get(f"rule_name_{rid}", r["name"])
+            r["applied_to"] = st.session_state.get(f"rule_applied_{rid}", [])
+            r["uni_common"] = st.session_state.get(f"rule_uni_common_{rid}", r["uni_common"])
+            r["common_in"] = st.session_state.get(f"rule_common_in_{rid}", [])
+            r["profit_loss"] = st.session_state.get(f"rule_profit_loss_{rid}", r["profit_loss"])
+            r["pl_comp"] = st.session_state.get(f"rule_pl_comp_{rid}", r["pl_comp"])
+            r["pl_from"] = st.session_state.get(f"rule_pl_from_{rid}", r["pl_from"])
+            r["pl_to"] = st.session_state.get(f"rule_pl_to_{rid}", r["pl_to"])
+            r["inv_comp"] = st.session_state.get(f"rule_inv_comp_{rid}", r["inv_comp"])
+            r["inv_from"] = st.session_state.get(f"rule_inv_from_{rid}", r["inv_from"])
+            r["inv_to"] = st.session_state.get(f"rule_inv_to_{rid}", r["inv_to"])
+            r["message"] = st.session_state.get(f"rule_message_{rid}", r["message"])
+            break
+    st.session_state.editing_rule_id = None
+    # Flag for toast outside callback
+    st.session_state.show_saved_toast = True
+
+def _rule_edit_form(rule:dict, portfolios:list):
+    rid = rule["id"]
+    st.text_input("Alert Name", value=rule["name"], key=f"rule_name_{rid}")
+    st.markdown("**1. Applied To**")
+    all_ports = st.checkbox("All Portfolios", key=f"rule_all_{rid}", value=(not rule["applied_to"]))
+    if all_ports:
+        st.session_state[f"rule_applied_{rid}"] = []
+        applied_display = portfolios
+    else:
+        st.multiselect("Select Portfolios", portfolios,
+                       default=rule["applied_to"], key=f"rule_applied_{rid}")
+        applied_display = st.session_state.get(f"rule_applied_{rid}", [])
+    st.markdown("**2. Unique / Common**")
+    st.radio("Scope", ["Unique","Common"], key=f"rule_uni_common_{rid}",
+             index=0 if rule["uni_common"]=="Unique" else 1, horizontal=True)
+    if st.session_state.get(f"rule_uni_common_{rid}") == "Common":
+        subset = applied_display if applied_display else portfolios
+        st.multiselect("Common Across (subset)", subset,
+                       default=rule["common_in"] if rule["common_in"] else subset,
+                       key=f"rule_common_in_{rid}")
+    st.markdown("**3. Profit / Loss Percentage**")
+    st.radio("Direction", ["Profit","Loss","Unchanged"], horizontal=True,
+             key=f"rule_profit_loss_{rid}",
+             index=["Profit","Loss","Unchanged"].index(rule["profit_loss"]))
+    direction = st.session_state.get(f"rule_profit_loss_{rid}")
+    if direction != "Unchanged":
+        st.selectbox("Comparator", PL_COMP_OPTS,
+                     index=PL_COMP_OPTS.index(rule["pl_comp"]), key=f"rule_pl_comp_{rid}")
+        comp = st.session_state.get(f"rule_pl_comp_{rid}")
+        if comp == "Range":
+            c1,c2 = st.columns(2)
+            with c1:
+                st.number_input("From (%)", value=rule["pl_from"], step=0.5, key=f"rule_pl_from_{rid}")
+            with c2:
+                st.number_input("To (%)", value=rule["pl_to"], step=0.5, key=f"rule_pl_to_{rid}")
+        else:
+            st.number_input("Value (%)", value=rule["pl_from"], step=0.5, key=f"rule_pl_from_{rid}")
+    st.markdown("**4. Investment**")
+    st.selectbox("Investment Comparator", PL_COMP_OPTS,
+                 index=PL_COMP_OPTS.index(rule["inv_comp"]), key=f"rule_inv_comp_{rid}")
+    inv_comp = st.session_state.get(f"rule_inv_comp_{rid}")
+    if inv_comp == "Range":
+        c3,c4 = st.columns(2)
+        with c3:
+            st.number_input("Investment From (₹)", value=float(rule["inv_from"]), step=5000.0,
+                            key=f"rule_inv_from_{rid}")
+        with c4:
+            st.number_input("Investment To (₹)", value=float(rule["inv_to"]), step=5000.0,
+                            key=f"rule_inv_to_{rid}")
+    else:
+        st.number_input("Investment Value (₹)", value=float(rule["inv_from"]), step=5000.0,
+                        key=f"rule_inv_from_{rid}")
+    st.markdown("**5. Alert Message**")
+    st.text_area("Message", value=rule["message"], key=f"rule_message_{rid}", height=70)
+    cbtn = st.columns([0.5,0.25,0.25])
+    with cbtn[1]:
+        st.button("Save", key=f"save_rule_{rid}", on_click=_save_rule, args=(rid,))
+    with cbtn[2]:
+        st.button("Cancel", key=f"cancel_rule_{rid}",
+                  on_click=lambda: st.session_state.update(editing_rule_id=None))
+
+def _alert_rules_dialog_body(portfolios):
+    portfolios = portfolios or []
+    if st.session_state.editing_rule_id:
+        rule = next((x for x in st.session_state.alert_rules
+                     if x["id"] == st.session_state.editing_rule_id), None)
+        st.markdown(f"### Edit Rule (ID {st.session_state.editing_rule_id})")
+        st.button("← Back to List", on_click=lambda: st.session_state.update(editing_rule_id=None),
+                  type="secondary")
+        st.divider()
+        if rule:
+            _rule_edit_form(rule, portfolios)
+        else:
+            st.warning("Rule not found.")
+    else:
+        st.markdown("### Alerts List")
+        # Only Reset + Close here (Add moved to main Alerts tab)
+        col_reset, col_close = st.columns([0.5,0.5])
+        with col_reset:
+            st.button("Reset (Delete All)", on_click=_reset_rules, use_container_width=True, type="secondary")
+        with col_close:
+            st.button("Close", on_click=_close_alert_rules_dialog, use_container_width=True)
+        st.divider()
+        for r in sorted(st.session_state.alert_rules, key=lambda x: x["id"]):
+            cols = st.columns([0.7,0.15,0.15])
+            with cols[0]:
+                st.write(r["name"])
+            with cols[1]:
+                st.button("✏️", key=f"edit_{r['id']}",
+                          on_click=_start_edit_rule, args=(r["id"],))
+            with cols[2]:
+                st.button("🗑️", key=f"del_{r['id']}",
+                          on_click=_delete_rule, args=(r["id"],))
+
+def refresh_portfolios():
     for k in list(st.session_state.keys()):
         if k.startswith("portfolio_"):
             del st.session_state[k]
+
+# Refresh
+if st.button("🔄 Refresh Portfolios"):
+    refresh_portfolios()
     st.rerun()
 
 def get_or_fetch(key, fetch_fn, *args, **kw):
@@ -147,210 +328,232 @@ dfs = {
 valid_dfs = {k: v for k, v in dfs.items() if not v.empty and "instrument" in v.columns}
 common_list, unique_per = compute_common_unique(valid_dfs)
 
-# ---- Unified Stocks Table (replaces previous status + table block) ----
-import pandas as pd
+# ------------------------------------------------------------------
+# TABS
+# ------------------------------------------------------------------
+tab_compare, tab_alerts, tab_overview = st.tabs(["Compare", "Alerts", "Overview"])
 
-# Build base table (all symbols, all portfolio % columns)
-if valid_dfs:
-    # Build master table once
-    all_symbols = sorted(set().union(*[df["instrument"] for df in valid_dfs.values()]))
-    rows = []
-    for sym in all_symbols:
-        present = []
-        pct_map = {}
-        for pname, dfp in valid_dfs.items():
-            match = dfp[dfp["instrument"] == sym]
-            if not match.empty:
-                present.append(pname)
-                pct_map[pname] = float(match.iloc[0].get("pnl_pct", 0))
-        avg_pct_all = round(sum(pct_map.values()) / len(pct_map), 2) if pct_map else 0
-        rows.append({
-            "Stock": sym,
-            "Portfolios": present,
-            "Avg % Up/Down": avg_pct_all,
-            **{f"{p} % Up/Down": pct_map.get(p, 0) for p in valid_dfs.keys()}
-        })
-    table_df = pd.DataFrame(rows)
+# ===================== COMPARE TAB =====================
+with tab_compare:
+    # ---- Unified Stocks Table (Comparison) ----
+    if valid_dfs:
+        all_symbols = sorted(set().union(*[df["instrument"] for df in valid_dfs.values()]))
+        rows = []
+        for sym in all_symbols:
+            present = []
+            pct_map = {}
+            for pname, dfp in valid_dfs.items():
+                match = dfp[dfp["instrument"] == sym]
+                if not match.empty:
+                    present.append(pname)
+                    pct_map[pname] = float(match.iloc[0].get("pnl_pct", 0))
+            avg_pct_all = round(sum(pct_map.values()) / len(pct_map), 2) if pct_map else 0
+            rows.append({
+                "Stock": sym,
+                "Portfolios": present,
+                "Avg % Up/Down": avg_pct_all,
+                **{f"{p} % Up/Down": pct_map.get(p, 0) for p in valid_dfs.keys()}
+            })
+        table_df = pd.DataFrame(rows)
 
-    # Force 2‑decimals now
-    pct_cols_all = [c for c in table_df.columns if c.endswith("% Up/Down")]
-    for c in pct_cols_all:
-        table_df[c] = pd.to_numeric(table_df[c], errors="coerce").round(2)
+        # Force 2 decimals
+        pct_cols_all = [c for c in table_df.columns if c.endswith("% Up/Down")]
+        for c in pct_cols_all:
+            table_df[c] = pd.to_numeric(table_df[c], errors="coerce").round(2)
 
-    st.subheader("📌 Stocks Across Portfolios")
+        st.subheader("📌 Stocks Across Portfolios")
 
-    # Session state init
-    if "portfolio_filter" not in st.session_state:
-        st.session_state["portfolio_filter"] = []
+        # Session state key specific to compare tab
+        if "compare_portfolio_filter" not in st.session_state:
+            st.session_state["compare_portfolio_filter"] = []
 
-    # Clear callback BEFORE widget instantiation
-    def clear_filters():
-        st.session_state["portfolio_filter"] = []
+        def clear_compare_filters():
+            st.session_state["compare_portfolio_filter"] = []
 
-    top_cols = st.columns([0.8, 0.2])
-    with top_cols[1]:
-        st.button("Clear All Filters", on_click=clear_filters)
+        col_select, col_clear = st.columns([0.9, 0.1])
+        with col_select:
+            st.multiselect(
+                "Filter with Portfolios",
+                options=list(valid_dfs.keys()),
+                key="compare_portfolio_filter"
+            )
+        with col_clear:
+            st.write("")
+            st.button("Clear All", on_click=clear_compare_filters, use_container_width=True)
 
-    with top_cols[0]:
-        portfolio_options = list(valid_dfs.keys())
-        st.multiselect(
-            "Filter with Portfolios",
-            options=portfolio_options,
-            key="portfolio_filter"
-        )
+        selected_ports = st.session_state["compare_portfolio_filter"]
+        disp = table_df.copy()
 
-    selected_ports = st.session_state["portfolio_filter"]
+        if selected_ports:
+            disp = disp[disp["Portfolios"].apply(lambda lst: all(p in lst for p in selected_ports))].copy()
+            sel_pct_cols = [f"{p} % Up/Down" for p in selected_ports]
+            if sel_pct_cols:
+                disp["Avg % Up/Down"] = disp[sel_pct_cols].mean(axis=1).round(2)
+            keep_cols = ["Stock", "Portfolios", "Avg % Up/Down"] + sel_pct_cols
+            disp = disp[keep_cols]
+        else:
+            pct_cols_all = [c for c in disp.columns if c.endswith("% Up/Down")]
+            disp[pct_cols_all] = disp[pct_cols_all].replace(0, pd.NA)
 
-    disp = table_df.copy()
+        disp["Portfolios"] = disp["Portfolios"].apply(lambda x: ", ".join(x))
 
-    if selected_ports:
-        # Intersection: stock must be in ALL selected portfolios
-        disp = disp[disp["Portfolios"].apply(lambda lst: all(p in lst for p in selected_ports))].copy()
-        sel_pct_cols = [f"{p} % Up/Down" for p in selected_ports]
-        # Recompute average for selected only
-        if sel_pct_cols:
-            disp["Avg % Up/Down"] = disp[sel_pct_cols].mean(axis=1).round(2)
-        # Keep only relevant % columns
-        keep_cols = ["Stock", "Portfolios", "Avg % Up/Down"] + sel_pct_cols
-        disp = disp[keep_cols]
-    else:
-        # No selection: show all; replace 0 with NA in % columns (including Avg)
-        pct_cols_all = [c for c in disp.columns if c.endswith("% Up/Down")]
-        disp[pct_cols_all] = disp[pct_cols_all].replace(0, pd.NA)
+        def color_pct(val):
+            if pd.isna(val):
+                return "color:#888;"
+            try:
+                v = float(val)
+            except Exception:
+                return ""
+            if v > 0:
+                return "color:green;font-weight:600;"
+            if v < 0:
+                return "color:red;font-weight:600;"
+            return "color:#555;"
 
-    # Portfolios list -> string
-    disp["Portfolios"] = disp["Portfolios"].apply(lambda x: ", ".join(x))
-
-    # Style function
-    def color_pct(val):
-        if pd.isna(val):
-            return "color:#888;"
-        try:
-            v = float(val)
-        except Exception:
-            return ""
-        if v > 0:
-            return "color:green;font-weight:600;"
-        if v < 0:
-            return "color:red;font-weight:600;"
-        return "color:#555;"
-
-    pct_cols_for_style = [c for c in disp.columns if c.endswith("% Up/Down")]
-
-    styled = (
-        disp.style
+        pct_cols_for_style = [c for c in disp.columns if c.endswith("% Up/Down")]
+        styled = (
+            disp.style
             .applymap(color_pct, subset=pct_cols_for_style)
             .format(
                 subset=pct_cols_for_style,
                 formatter=lambda v: "NA" if pd.isna(v) else f"{float(v):.2f}"
             )
-    )
+        )
+        st.dataframe(styled, use_container_width=True)
 
-    st.dataframe(styled, use_container_width=True)
-else:
-    st.warning("No valid portfolio data.")
+        # (Optional) show unique/common chips if you want inside Compare tab
+        with st.expander("Common & Unique Summary", expanded=False):
+            st.markdown(f"**Common Symbols ({len(common_list)})**: {', '.join(common_list) if common_list else 'None'}")
+            for pname in valid_dfs.keys():
+                st.markdown(f"**Unique to {pname}**:")
+                st.markdown(" ".join(unique_per.get(pname, [])) or "_None_")
+    else:
+        st.warning("No valid portfolio data to compare.")
 
-# Alerts (optional – uses existing logic)
-if valid_dfs:
-    alerts_df = generate_alerts(
-        valid_dfs, common_list, unique_per,
-        uniq_loss_thresh=uniq_loss_thresh,
-        common_small_loss=common_small_loss,
-        common_large_loss=common_large_loss,
-        small_amt=small_amt,
-        large_amt=large_amt,
-        profit_small_pct=profit_small_pct,
-        profit_large_pct=profit_large_pct
-    )
+# ===================== ALERTS TAB =====================
+with tab_alerts:
     st.subheader("🚨 Alerts & Opportunities")
 
-    if alerts_df.empty:
-        st.info("No alerts triggered.")
+    # Top action buttons row
+    btn_cols = st.columns([0.15, 0.15, 0.70])
+    with btn_cols[0]:
+        add_clicked = st.button("➕ Add Rule", key="add_rule_main")
+        if add_clicked:
+            # Create new rule THEN just set the dialog flag (do NOT clear editing_rule_id)
+            _add_rule()  # sets editing_rule_id to new rule
+            st.session_state.show_alert_rules_dialog = True
+
+    with btn_cols[1]:
+        if st.session_state.alert_rules:
+            if st.button("⚙️ Settings", key="open_alert_rules"):
+                open_alert_rules_dialog()
+
+    # If no rules, show only Add Rule and exit
+    if not st.session_state.alert_rules:
+        st.info("No alert rules configured. Use 'Add Rule' to create one.")
     else:
-        mode = st.radio("View Mode", ["Portfolio wise", "Alerts wise"], horizontal=True)
-
-        # Helper to render category cards
-        def render_category_cards(df_subset):
-            category_styles = {
-                "Yellow": ("🟨 Opportunity", "background:#fff7e6"),
-                "Red": ("🟥 Average Out", "background:#ffeaea"),
-                "Green": ("🟩 Book Profit", "background:#e9fff1"),
-            }
-            for cat, (title, css) in category_styles.items():
-                cat_df = df_subset[df_subset["category"] == cat]
-                if cat_df.empty:
-                    continue
-                st.markdown(f"### {title}")
-                for _, r in cat_df.iterrows():
-                    st.markdown(
-                        f"<div style='{css};padding:8px;border-radius:6px;margin-bottom:6px'>"
-                        f"<b>{r['instrument']}</b><br>"
-                        f"<small>{r['message']}<br>"
-                        f"Rule: {r['rule']} | Portfolio: {r['portfolio']}</small>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-
-        if mode == "Portfolio wise":
-            port_choice = st.selectbox("Select Portfolio", list(valid_dfs.keys()))
-            p_df = alerts_df[alerts_df["portfolio"] == port_choice]
-            if p_df.empty:
-                st.warning("No alerts for this portfolio.")
+        if valid_dfs:
+            alerts_df = generate_alerts(valid_dfs, st.session_state.alert_rules)
+            if alerts_df.empty:
+                st.info("No alerts triggered for current rules.")
             else:
-                render_category_cards(p_df)
+                view_mode = st.radio("View Mode", ["By Portfolio", "By Rule"], horizontal=True)
+                if view_mode == "By Portfolio":
+                    port = st.selectbox("Select Portfolio", sorted(alerts_df["portfolio"].unique()))
+                    to_show = alerts_df[alerts_df["portfolio"] == port]
+                else:
+                    rule = st.selectbox("Select Rule", sorted(alerts_df["rule"].unique()))
+                    to_show = alerts_df[alerts_df["rule"] == rule]
 
-        else:  # Alerts wise
-            c1, c2, c3 = st.columns([0.25, 0.25, 0.25])
-            with c1:
-                show_yellow = st.checkbox("Opportunity (Yellow)", value=True)
-            with c2:
-                show_red = st.checkbox("Average Out (Red)", value=True)
-            with c3:
-                show_green = st.checkbox("Book Profit (Green)", value=True)
-            
+                if to_show.empty:
+                    st.warning("No matches for this selection.")
+                else:
+                    for _, r in to_show.iterrows():
+                        st.markdown(
+                            f"<div style='background:#f5f5f5;padding:8px;border-radius:6px;margin-bottom:6px'>"
+                            f"<b>{r['instrument']}</b> "
+                            f"<span style='font-size:0.8rem;color:#555'>(Portfolio: {r['portfolio']} | Rule: {r['rule']})</span><br>"
+                            f"<small>{r['message']}</small>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
+        else:
+            st.warning("No portfolios loaded to generate alerts.")
 
-            chosen = []
-            if show_yellow: chosen.append("Yellow")
-            if show_red: chosen.append("Red")
-            if show_green: chosen.append("Green")
+# ===================== OVERVIEW TAB =====================
+with tab_overview:
+    st.subheader("⭐ Overview: Highlights & Holdings")
+    if not dfs:
+        st.warning("No data.")
+    else:
+        c1, c2 = st.columns(2)
 
-            if not chosen:
-                st.info("Select at least one alert category.")
+        with c1:
+            sel_h = st.selectbox("Highlights portfolio", list(dfs.keys()), key="highlights_select")
+            dfh = dfs[sel_h]
+            if not dfh.empty:
+                highlights = portfolio_highlights(dfh)
+                st.write("Top 3 Max Capital:")
+                for t in highlights["max_capital"]:
+                    st.write("🔹", t)
+                st.write("Top 3 Profit:")
+                for t in highlights["max_profit"]:
+                    st.write("🟩", t)
+                st.write("Top 3 Loss:")
+                for t in highlights["max_loss"]:
+                    st.write("🟥", t)
             else:
-                filtered = alerts_df[alerts_df["category"].isin(chosen)]
-                render_category_cards(filtered)
+                st.warning("No data.")
 
-# Highlights
-st.subheader("⭐ Highlights & 📂 Holdings")
-c1, c2 = st.columns(2)
+        with c2:
+            sel_hold = st.selectbox("Holdings portfolio", list(dfs.keys()), key="holdings_select")
+            dff = dfs[sel_hold]
+            if not dff.empty:
+                st.dataframe(dff, use_container_width=True)
+                st.download_button(
+                    f"Download {sel_hold} CSV",
+                    data=dff.to_csv(index=False).encode("utf-8"),
+                    file_name=f"{sel_hold}_holdings.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("No data.")
 
-with c1:
-    sel_h = st.selectbox("Highlights portfolio", list(dfs.keys()))
-    dfh = dfs[sel_h]
-    if not dfh.empty:
-        highlights = portfolio_highlights(dfh)
-        st.write("Top 3 Max Capital:")
-        for t in highlights["max_capital"]:
-            st.write("🔹", t)
-        st.write("Top 3 Profit:")
-        for t in highlights["max_profit"]:
-            st.write("🟩", t)
-        st.write("Top 3 Loss:")
-        for t in highlights["max_loss"]:
-            st.write("🟥", t)
+if st.session_state.get("show_alert_rules_dialog"):
+    _ports = list(valid_dfs.keys())
+    if hasattr(st, "dialog"):
+        @st.dialog("Set Alert Rules")
+        def _alerts_dialog():
+            _alert_rules_dialog_body(_ports)
+        _alerts_dialog()
     else:
-        st.warning("No data.")
+        with st.expander("Set Alert Rules", expanded=True):
+            _alert_rules_dialog_body(_ports)
 
-with c2:
-    sel_hold = st.selectbox("Holdings portfolio", list(dfs.keys()))
-    dff = dfs[sel_hold]
-    if not dff.empty:
-        st.dataframe(dff, use_container_width=True)
-        st.download_button(
-            f"Download {sel_hold} CSV",
-            data=dff.to_csv(index=False).encode("utf-8"),
-            file_name=f"{sel_hold}_holdings.csv",
-            mime="text/csv"
-        )
-    else:
-        st.warning("No data.")
+# PATCH: Remove UI rendering (st.toast) from callbacks to eliminate fragment rerun warning.
+# 1. Modify _save_rule to NOT call st.toast directly.
+def _save_rule(rid:int):
+    for r in st.session_state.alert_rules:
+        if r["id"] == rid:
+            r["name"] = st.session_state.get(f"rule_name_{rid}", r["name"])
+            r["applied_to"] = st.session_state.get(f"rule_applied_{rid}", [])
+            r["uni_common"] = st.session_state.get(f"rule_uni_common_{rid}", r["uni_common"])
+            r["common_in"] = st.session_state.get(f"rule_common_in_{rid}", [])
+            r["profit_loss"] = st.session_state.get(f"rule_profit_loss_{rid}", r["profit_loss"])
+            r["pl_comp"] = st.session_state.get(f"rule_pl_comp_{rid}", r["pl_comp"])
+            r["pl_from"] = st.session_state.get(f"rule_pl_from_{rid}", r["pl_from"])
+            r["pl_to"] = st.session_state.get(f"rule_pl_to_{rid}", r["pl_to"])
+            r["inv_comp"] = st.session_state.get(f"rule_inv_comp_{rid}", r["inv_comp"])
+            r["inv_from"] = st.session_state.get(f"rule_inv_from_{rid}", r["inv_from"])
+            r["inv_to"] = st.session_state.get(f"rule_inv_to_{rid}", r["inv_to"])
+            r["message"] = st.session_state.get(f"rule_message_{rid}", r["message"])
+            break
+    st.session_state.editing_rule_id = None
+    # Flag for toast outside callback
+    st.session_state.show_saved_toast = True
+
+# 2. After your main layout begins (anywhere AFTER st.set_page_config and BEFORE tabs render),
+#    add this small block ONCE (make sure it isn’t duplicated):
+if st.session_state.get("show_saved_toast"):
+    st.toast("Rule saved")
+    st.session_state.show_saved_toast = False
