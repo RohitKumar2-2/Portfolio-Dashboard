@@ -1,105 +1,178 @@
 import pandas as pd
 from typing import Dict, List
 
-# New rule-driven alert engine.
-# valid_dfs: { portfolio_name: DataFrame(instrument, pnl_pct, invested, ...) }
-# alert_rules: list of dicts (stored in st.session_state.alert_rules)
-#
-# Rule fields used:
-#  name, applied_to(list), uni_common("Unique"/"Common"), common_in(list),
-#  profit_loss("Profit"/"Loss"/"Unchanged"), pl_comp("Greater Than"/"Less Than"/"Range"),
-#  pl_from(float), pl_to(float), inv_comp(...), inv_from(float), inv_to(float), message(str)
+def _value_matches(comp: str, val: float, from_v: float, to_v: float) -> bool:
+    if comp == "Greater Than":
+        return val >= from_v
+    if comp == "Less Than":
+        return val <= from_v
+    if comp == "Range":
+        lo, hi = sorted([from_v, to_v])
+        return lo <= val <= hi
+    return False
 
 def generate_alerts(valid_dfs: Dict[str, pd.DataFrame], alert_rules: List[dict]) -> pd.DataFrame:
     if not valid_dfs or not alert_rules:
         return pd.DataFrame(columns=["instrument","portfolio","rule","message"])
-    # Precompute instrument sets
-    inst_sets = {p: set(df["instrument"].dropna().unique()) for p, df in valid_dfs.items()}
-    all_ports = list(valid_dfs.keys())
 
+    # Ensure invested column exists (quantity * avg_price fallback)
+    prepared = {}
+    for p, df in valid_dfs.items():
+        if df is None or df.empty:
+            prepared[p] = df
+            continue
+        if "invested" not in df.columns:
+            tmp = df.copy()
+            if "quantity" in tmp.columns and "avg_price" in tmp.columns:
+                tmp["invested"] = tmp["quantity"] * tmp["avg_price"]
+            else:
+                tmp["invested"] = 0.0
+            prepared[p] = tmp
+        else:
+            prepared[p] = df
+
+    inst_sets = {p: set(df["instrument"].dropna().unique()) for p, df in prepared.items() if df is not None and not df.empty}
+    all_ports = list(prepared.keys())
     records = []
 
     for rule in alert_rules:
-        # ---- Skip incomplete (new) rules ----
+        # Basic rule validity checks
         dir_ok = rule.get("profit_loss") in {"Profit","Loss","Unchanged"}
         inv_ok = rule.get("inv_comp") in {"Greater Than","Less Than","Range"}
         if not dir_ok or not inv_ok:
             continue
         if rule.get("profit_loss") != "Unchanged":
-            comp_ok = rule.get("pl_comp") in {"Greater Than","Less Than","Range"}
-            if not comp_ok:
+            if rule.get("pl_comp") not in {"Greater Than","Less Than","Range"}:
                 continue
-        # -------------------------------------
-        applied = rule.get("applied_to") or all_ports  # empty => all
-        applied = [p for p in applied if p in valid_dfs]  # safety
+
+        applied = rule.get("applied_to") or all_ports
+        applied = [p for p in applied if p in prepared]
         if not applied:
             continue
 
-        scope = rule.get("uni_common","Unique")
-        direction = rule.get("profit_loss")
-        pl_comp = rule.get("pl_comp","Greater Than")
-        pl_from = float(rule.get("pl_from",0) or 0)
-        pl_to = float(rule.get("pl_to",pl_from) or pl_from)
-        inv_comp = rule.get("inv_comp","Greater Than")
-        inv_from = float(rule.get("inv_from",0) or 0)
-        inv_to = float(rule.get("inv_to",inv_from) or inv_from)
-        message = rule.get("message") or rule.get("name") or "Alert"
-        rule_name = rule.get("name") or f"Rule {rule.get('id','')}"
+        scope        = rule.get("uni_common","Unique")
+        direction    = rule.get("profit_loss")
+        pl_comp      = rule.get("pl_comp","Greater Than")
+        pl_from      = float(rule.get("pl_from",0) or 0)
+        pl_to        = float(rule.get("pl_to",pl_from) or pl_from)
+        inv_comp     = rule.get("inv_comp","Greater Than")
+        inv_from     = float(rule.get("inv_from",0) or 0)
+        inv_to       = float(rule.get("inv_to",inv_from) or inv_from)
+        inv_level    = rule.get("inv_level","Per Stock")  # NEW
+        message      = rule.get("message") or rule.get("name") or "Alert"
+        rule_name    = rule.get("name") or f"Rule {rule.get('id','')}"
 
-        def pl_filter(df):
-            if df.empty or "pnl_pct" not in df.columns: return df.iloc[0:0]
+        # ---- P/L filter function (row-level) ----
+        def pl_filter(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty or "pnl_pct" not in df.columns:
+                return df.iloc[0:0]
             if direction == "Unchanged":
                 return df[df["pnl_pct"].abs() <= 0.0001]
-            base = df[df["pnl_pct"] > 0] if direction=="Profit" else df[df["pnl_pct"] < 0]
-            if base.empty: return base
-            val = base["pnl_pct"] if direction=="Profit" else base["pnl_pct"].abs()
+            base = df[df["pnl_pct"] > 0] if direction == "Profit" else df[df["pnl_pct"] < 0]
+            if base.empty:
+                return base
+            # For Loss compare on absolute magnitude
+            val = base["pnl_pct"] if direction == "Profit" else base["pnl_pct"].abs()
             if pl_comp == "Greater Than":
                 return base[val >= pl_from]
             if pl_comp == "Less Than":
                 return base[val <= pl_from]
             if pl_comp == "Range":
-                lo,hi = sorted([pl_from,pl_to])
+                lo, hi = sorted([pl_from, pl_to])
                 return base[(val >= lo) & (val <= hi)]
             return base
 
-        def inv_filter(df):
-            if df.empty or "invested" not in df.columns: return df.iloc[0:0]
-            val = df["invested"]
-            if inv_comp == "Greater Than": return df[val >= inv_from]
-            if inv_comp == "Less Than": return df[val <= inv_from]
-            if inv_comp == "Range":
-                lo,hi = sorted([inv_from,inv_to])
-                return df[(val >= lo) & (val <= hi)]
-            return df
-
-        # Determine candidate symbols per portfolio based on Unique/Common
-        if scope == "Common":
-            subset = rule.get("common_in") or applied
-            subset = [p for p in subset if p in applied]
-            if not subset: subset = applied
-            if not subset: continue
-            common_syms = set.intersection(*[inst_sets[p] for p in subset]) if subset else set()
-            # We'll alert once per portfolio in 'subset' for each symbol (so user sees portfolio context)
-            for p in subset:
-                dfp = valid_dfs[p]
-                part = dfp[dfp["instrument"].isin(common_syms)]
-                part = inv_filter(pl_filter(part))
-                for _, r in part.iterrows():
-                    records.append({"instrument": r["instrument"],"portfolio": p,
-                                    "rule": rule_name,"message": message})
-        else:  # Unique
-            # Unique within 'applied'
-            union_applied = {p: inst_sets[p] for p in applied}
+        # ---- Investment filtering logic ----
+        # Per Portfolio gate: decide which portfolios pass BEFORE symbol selection
+        if inv_level == "Per Portfolio":
+            passing_ports = []
             for p in applied:
-                others = set().union(*[union_applied[o] for o in applied if o != p])
-                unique_syms = inst_sets[p] - others
-                if not unique_syms: continue
-                dfp = valid_dfs[p]
-                part = dfp[dfp["instrument"].isin(unique_syms)]
-                part = inv_filter(pl_filter(part))
+                dfp = prepared[p]
+                if dfp is None or dfp.empty:
+                    continue
+                total_inv = float(dfp["invested"].sum())
+                if _value_matches(inv_comp, total_inv, inv_from, inv_to):
+                    passing_ports.append(p)
+            if not passing_ports:
+                continue  # no portfolio satisfies investment gate
+            target_ports_for_scope = passing_ports
+        else:
+            # Per Stock: we will apply comparator later per row; keep original applied list now
+            target_ports_for_scope = applied
+
+        # ---- Scope (Unique / Common) symbol selection ----
+        if scope == "Common":
+            subset = rule.get("common_in") or target_ports_for_scope
+            subset = [p for p in subset if p in target_ports_for_scope]
+            if not subset:
+                continue
+            # Intersection of instruments across subset portfolios
+            if not subset:
+                continue
+            common_syms = set.intersection(*[inst_sets.get(p,set()) for p in subset]) if all(p in inst_sets for p in subset) else set()
+            if not common_syms:
+                continue
+            for p in subset:
+                dfp = prepared[p]
+                if dfp is None or dfp.empty:
+                    continue
+                part = dfp[dfp["instrument"].isin(common_syms)].copy()
+                if part.empty:
+                    continue
+                # Apply row-level investment filter only if Per Stock
+                if inv_level == "Per Stock":
+                    val = part["invested"]
+                    if inv_comp == "Greater Than":
+                        part = part[val >= inv_from]
+                    elif inv_comp == "Less Than":
+                        part = part[val <= inv_from]
+                    elif inv_comp == "Range":
+                        lo, hi = sorted([inv_from, inv_to])
+                        part = part[(val >= lo) & (val <= hi)]
+                # P/L filter
+                part = pl_filter(part)
+                if part.empty:
+                    continue
                 for _, r in part.iterrows():
-                    records.append({"instrument": r["instrument"],"portfolio": p,
-                                    "rule": rule_name,"message": message})
+                    records.append({
+                        "instrument": r["instrument"],
+                        "portfolio": p,
+                        "rule": rule_name,
+                        "message": message
+                    })
+        else:  # Unique
+            for p in target_ports_for_scope:
+                dfp = prepared[p]
+                if dfp is None or dfp.empty:
+                    continue
+                # Unique symbols relative to other (target) portfolios
+                others = set().union(*[inst_sets.get(o,set()) for o in target_ports_for_scope if o != p])
+                unique_syms = inst_sets.get(p,set()) - others
+                if not unique_syms:
+                    continue
+                part = dfp[dfp["instrument"].isin(unique_syms)].copy()
+                if part.empty:
+                    continue
+                if inv_level == "Per Stock":
+                    val = part["invested"]
+                    if inv_comp == "Greater Than":
+                        part = part[val >= inv_from]
+                    elif inv_comp == "Less Than":
+                        part = part[val <= inv_from]
+                    elif inv_comp == "Range":
+                        lo, hi = sorted([inv_from, inv_to])
+                        part = part[(val >= lo) & (val <= hi)]
+                # (If Per Portfolio we already gated; no per-row invested filter.)
+                part = pl_filter(part)
+                if part.empty:
+                    continue
+                for _, r in part.iterrows():
+                    records.append({
+                        "instrument": r["instrument"],
+                        "portfolio": p,
+                        "rule": rule_name,
+                        "message": message
+                    })
 
     if not records:
         return pd.DataFrame(columns=["instrument","portfolio","rule","message"])

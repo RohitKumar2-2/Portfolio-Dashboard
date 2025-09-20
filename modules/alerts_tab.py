@@ -14,7 +14,6 @@ def init_alert_rules_state():
 
 # --------- CRUD Helpers ---------
 def _new_rule_template(next_id: int):
-    # id kept for potential reference display; final id assigned on save if NEW
     return {
         "id": next_id,
         "name": "",
@@ -28,6 +27,7 @@ def _new_rule_template(next_id: int):
         "inv_comp": "",
         "inv_from": 0.0,
         "inv_to": 0.0,
+        "inv_level": "Per Stock",  # NEW: investment evaluation level
         "message": ""
     }
 
@@ -85,6 +85,7 @@ def save_existing_rule(rid: int):
             r["inv_comp"] = ss.get(f"rule_inv_comp_{rid}", r["inv_comp"])
             r["inv_from"] = ss.get(f"rule_inv_from_{rid}", r["inv_from"])
             r["inv_to"] = ss.get(f"rule_inv_to_{rid}", r["inv_to"])
+            r["inv_level"] = ss.get(f"rule_inv_level_{rid}", r.get("inv_level","Per Stock"))  # NEW
             r["message"] = ss.get(f"rule_message_{rid}", r["message"])
             break
     ss.editing_rule_id = None
@@ -119,11 +120,14 @@ def _capture_form_inputs(prefix_id, rule_obj, portfolios):
     st.markdown("**2. Scope**")
     st.radio("Unique / Common", ["Unique","Common"], key=f"rule_uni_common_{rid}",
              index=0 if rule_obj.get("uni_common")=="Unique" else 1, horizontal=True)
-    if st.session_state.get(f"rule_uni_common_{rid}") == "Common":
+    mode = st.session_state[f"rule_uni_common_{rid}"]
+    if mode == "Common":
         subset = applied_display if applied_display else portfolios
         st.multiselect("Common Across (subset)", subset,
                        default=rule_obj["common_in"] if rule_obj["common_in"] else subset,
                        key=f"rule_common_in_{rid}")
+    else:
+        st.session_state[f"rule_common_in_{rid}"] = []
 
     st.markdown("**3. Profit / Loss**")
     dir_opts = ["Profit","Loss","Unchanged"]
@@ -150,6 +154,15 @@ def _capture_form_inputs(prefix_id, rule_obj, portfolios):
             st.number_input("Value (%)", value=rule_obj.get("pl_from",0.0), step=0.5, key=f"rule_pl_from_{rid}")
 
     st.markdown("**4. Investment Filter**")
+    # NEW radio for investment evaluation level
+    st.radio(
+        "Investment Scope",
+        ["Per Portfolio", "Per Stock"],
+        key=f"rule_inv_level_{rid}",
+        index=0 if rule_obj.get("inv_level") == "Per Portfolio" else 1,
+        horizontal=True,
+        help="Per Portfolio: compare total invested amount of each portfolio.\nPer Stock: compare invested amount per stock aggregated across applied portfolios."
+    )
     inv_opts = PL_COMP_OPTS
     cur_inv = rule_obj.get("inv_comp","")
     idx_inv = inv_opts.index(cur_inv)+1 if cur_inv in inv_opts else 0
@@ -187,6 +200,7 @@ def _draft_from_session(r):
         "inv_comp": st.session_state.get(f"rule_inv_comp_{rid}", r.get("inv_comp","")),
         "inv_from": st.session_state.get(f"rule_inv_from_{rid}", r.get("inv_from",0.0)),
         "inv_to": st.session_state.get(f"rule_inv_to_{rid}", r.get("inv_to",0.0)),
+        "inv_level": st.session_state.get(f"rule_inv_level_{rid}", r.get("inv_level","Per Stock")),  # NEW
         "message": st.session_state.get(f"rule_message_{rid}", r.get("message",""))
     }
 
@@ -276,8 +290,6 @@ def render_alerts_tab(valid_dfs):
     init_alert_rules_state()
     ss = st.session_state
 
-    st.subheader("🚨 Alerts & Opportunities")
-
     opened_this_run = False
     col_add, col_settings = st.columns([0.15,0.15])
     with col_add:
@@ -293,7 +305,6 @@ def render_alerts_tab(valid_dfs):
 
     # Auto-close stray dialog flag if not explicitly opened this run and not editing
     if ss.show_alert_rules_dialog and not opened_this_run and ss.editing_rule_id is None:
-        # User probably closed dialog; prevent auto re-open on other widget interactions
         ss.show_alert_rules_dialog = False
 
     # Empty state
@@ -322,11 +333,42 @@ def render_alerts_tab(valid_dfs):
                 if subset.empty:
                     st.warning("No matches for selection.")
                 else:
+                    MAX_PCT = 0.10  # 10%
                     for _, r in subset.iterrows():
+                        portfolio_name = r["portfolio"]
+                        df_port = valid_dfs.get(portfolio_name)
+                        if df_port is None or df_port.empty:
+                            continue
+                        # Ensure invested column
+                        if "invested" not in df_port.columns and {"quantity","avg_price"}.issubset(df_port.columns):
+                            df_calc = df_port.copy()
+                            df_calc["invested"] = df_calc["quantity"] * df_calc["avg_price"]
+                        else:
+                            df_calc = df_port
+                        total_cap = float(df_calc["invested"].sum()) if "invested" in df_calc.columns else 0.0
+                        max_inv = total_cap * MAX_PCT
+                        cur_inv = float(
+                            df_calc.loc[df_calc["instrument"] == r["instrument"], "invested"].sum()
+                        ) if "invested" in df_calc.columns else 0.0
+                        exceed = cur_inv > max_inv and max_inv > 0
+                        rem = max_inv - cur_inv
+                        cur_inv_html = f"<span style='color:{'red' if exceed else '#222'}'>₹{cur_inv:,.0f}</span>"
+                        if exceed:
+                            rem_html = "<span style='color:red'>Investment exceeded 10% limit</span>"
+                        else:
+                            rem_html = f"Rem: ₹{rem:,.0f}"
+                        max_inv_html = f"₹{max_inv:,.0f}"
+                        header_line = (
+                            f"<b>{r['instrument']}</b> "
+                            f"<span style='font-size:0.72rem;color:#555'>"
+                            f"(Portfolio: {portfolio_name} | Rule: {r['rule']} | "
+                            f"Max: {max_inv_html} (10%) | Curr: {cur_inv_html} | {rem_html})"
+                            f"</span>"
+                        )
+
                         st.markdown(
                             f"<div style='background:#f5f5f5;padding:8px;border-radius:6px;margin-bottom:6px'>"
-                            f"<b>{r['instrument']}</b> "
-                            f"<span style='font-size:0.75rem;color:#555'>(Portfolio: {r['portfolio']} | Rule: {r['rule']})</span><br>"
+                            f"{header_line}<br>"
                             f"<small>{r['message']}</small>"
                             f"</div>",
                             unsafe_allow_html=True
