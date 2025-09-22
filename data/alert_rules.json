@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "name": "Book Profit",
+    "applied_to": [],
+    "uni_common": "Unique",
+    "common_in": [],
+    "profit_loss": "Profit",
+    "pl_comp": "Greater Than",
+    "pl_from": 12.0,
+    "pl_to": 0.0,
+    "inv_comp": "Less Than",
+    "inv_from": 50000.0,
+    "inv_to": 0.0,
+    "inv_level": "Per Stock",
+    "message": "Time to book profit"
+  }
+]
