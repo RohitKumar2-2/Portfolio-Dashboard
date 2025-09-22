@@ -1,18 +1,34 @@
 [
   {
-    "id": 1,
-    "name": "Book Profit",
+    "id": 2,
+    "name": "Unique Stocks Opportunity",
     "applied_to": [],
-    "uni_common": "Unique",
-    "common_in": [],
-    "profit_loss": "Profit",
+    "stock_presence": "Unique",
+    "profit_loss": "Loss",
     "pl_comp": "Greater Than",
-    "pl_from": 12.0,
+    "pl_from": 5.0,
     "pl_to": 0.0,
-    "inv_comp": "Less Than",
-    "inv_from": 50000.0,
+    "pl_basis": "Per Portfolio",
+    "inv_comp": "Greater Than",
+    "inv_from": 0.0,
     "inv_to": 0.0,
-    "inv_level": "Per Stock",
-    "message": "Time to book profit"
+    "inv_level": "Per Portfolio",
+    "message": "Buying opportunity for this stock."
+  },
+  {
+    "id": 3,
+    "name": "Common Stock Oppotunity",
+    "applied_to": [],
+    "stock_presence": "Not Unique",
+    "profit_loss": "Loss",
+    "pl_comp": "Greater Than",
+    "pl_from": 5.0,
+    "pl_to": 0.0,
+    "pl_basis": "Total Avg",
+    "inv_comp": "Greater Than",
+    "inv_from": 0.0,
+    "inv_to": 0.0,
+    "inv_level": "Per Portfolio",
+    "message": "Buy these stock in other portfoio where  NOT present"
   }
 ]

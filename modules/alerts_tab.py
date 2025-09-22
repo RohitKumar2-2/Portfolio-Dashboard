@@ -62,6 +62,23 @@ def init_alert_rules_state():
                 ss.next_rule_id = max((r.get("id") or 0) for r in loaded) + 1
             except ValueError:
                 ss.next_rule_id = 1
+        # Migrate legacy fields (uni_common/common_in) to stock_presence
+        changed = False
+        for r in ss.alert_rules:
+            if "stock_presence" not in r:
+                uc = r.get("uni_common")
+                if uc == "Unique":
+                    r["stock_presence"] = "Unique"
+                elif uc == "Common":
+                    r["stock_presence"] = "Not Unique"
+                else:
+                    r["stock_presence"] = "All"
+                changed = True
+            # Strip legacy keys if you want (optional)
+            r.pop("uni_common", None)
+            r.pop("common_in", None)
+        if changed:
+            _save_rules_to_disk(ss.alert_rules)
 
 
 # --------- CRUD Helpers ---------
@@ -70,16 +87,16 @@ def _new_rule_template(next_id: int):
         "id": next_id,
         "name": "",
         "applied_to": [],
-        "uni_common": "Unique",
-        "common_in": [],
+        "stock_presence": "All",
         "profit_loss": "",
         "pl_comp": "",
         "pl_from": 0.0,
         "pl_to": 0.0,
+        "pl_basis": "Per Portfolio",    # NEW: Per Portfolio | Total Avg
         "inv_comp": "",
         "inv_from": 0.0,
         "inv_to": 0.0,
-        "inv_level": "Per Stock",  # investment evaluation level
+        "inv_level": "Per Stock",
         "message": ""
     }
 
@@ -135,12 +152,12 @@ def save_existing_rule(rid: int):
         if r.get("id") == rid:
             r["name"] = ss.get(f"rule_name_{rid}", r.get("name"))
             r["applied_to"] = ss.get(f"rule_applied_{rid}", r.get("applied_to", []))
-            r["uni_common"] = ss.get(f"rule_uni_common_{rid}", r.get("uni_common", "Unique"))
-            r["common_in"] = ss.get(f"rule_common_in_{rid}", r.get("common_in", []))
+            r["stock_presence"] = ss.get(f"rule_presence_{rid}", r.get("stock_presence", "All"))
             r["profit_loss"] = ss.get(f"rule_profit_loss_{rid}", r.get("profit_loss", ""))
             r["pl_comp"] = ss.get(f"rule_pl_comp_{rid}", r.get("pl_comp", ""))
             r["pl_from"] = ss.get(f"rule_pl_from_{rid}", r.get("pl_from", 0.0))
             r["pl_to"] = ss.get(f"rule_pl_to_{rid}", r.get("pl_to", 0.0))
+            r["pl_basis"] = ss.get(f"rule_pl_basis_{rid}", r.get("pl_basis", "Per Portfolio"))  # NEW
             r["inv_comp"] = ss.get(f"rule_inv_comp_{rid}", r.get("inv_comp", ""))
             r["inv_from"] = ss.get(f"rule_inv_from_{rid}", r.get("inv_from", 0.0))
             r["inv_to"] = ss.get(f"rule_inv_to_{rid}", r.get("inv_to", 0.0))
@@ -186,25 +203,22 @@ def _capture_form_inputs(prefix_id, rule_obj, portfolios):
         )
         applied_display = st.session_state.get(f"rule_applied_{rid}", [])
 
-    st.markdown("**2. Scope**")
+    st.markdown("**2. Stock Presence**")
+    presence_opts = ["Unique", "Not Unique", "All"]
+    cur_presence = rule_obj.get("stock_presence", "All")
+    idx_presence = presence_opts.index(cur_presence) if cur_presence in presence_opts else 2
     st.radio(
-        "Unique / Common",
-        ["Unique", "Common"],
-        key=f"rule_uni_common_{rid}",
-        index=0 if rule_obj.get("uni_common") == "Unique" else 1,
-        horizontal=True
-    )
-    mode = st.session_state[f"rule_uni_common_{rid}"]
-    if mode == "Common":
-        subset = applied_display if applied_display else portfolios
-        st.multiselect(
-            "Common Across (subset)",
-            subset,
-            default=rule_obj.get("common_in") if rule_obj.get("common_in") else subset,
-            key=f"rule_common_in_{rid}"
+        "Select Presence",
+        presence_opts,
+        index=idx_presence,
+        key=f"rule_presence_{rid}",
+        horizontal=True,
+        help=(
+            "Unique: stocks appearing in exactly one selected portfolio.\n"
+            "Not Unique: stocks appearing in more than one selected portfolio.\n"
+            "All: every stock (union of all selected portfolios)."
         )
-    else:
-        st.session_state[f"rule_common_in_{rid}"] = []
+    )
 
     st.markdown("**3. Profit / Loss**")
     dir_opts = ["Profit", "Loss", "Unchanged"]
@@ -229,6 +243,20 @@ def _capture_form_inputs(prefix_id, rule_obj, portfolios):
             key=f"rule_pl_comp_{rid}",
             format_func=lambda v: "Select comparator" if v == "" else v
         )
+        # NEW: Basis radio (only when a comparator is chosen)
+        if comp:
+            st.radio(
+                "P/L Basis",
+                ["Per Portfolio", "Total Avg"],
+                key=f"rule_pl_basis_{rid}",
+                index=0 if rule_obj.get("pl_basis", "Per Portfolio") == "Per Portfolio" else 1,
+                horizontal=True,
+                help=(
+                    "Per Portfolio: compare each holding's own % P/L to the threshold.\n"
+                    "Total Avg: compute instrument average % P/L across applied portfolios; "
+                    "if that average matches the threshold, all its holdings (matching direction) alert."
+                )
+            )
         if comp == "Range":
             c1, c2 = st.columns(2)
             with c1:
@@ -297,12 +325,12 @@ def _draft_from_session(r):
         "id": r["id"],
         "name": st.session_state.get(f"rule_name_{rid}", r.get("name", "")),
         "applied_to": st.session_state.get(f"rule_applied_{rid}", r.get("applied_to", [])),
-        "uni_common": st.session_state.get(f"rule_uni_common_{rid}", r.get("uni_common", "Unique")),
-        "common_in": st.session_state.get(f"rule_common_in_{rid}", r.get("common_in", [])),
+        "stock_presence": st.session_state.get(f"rule_presence_{rid}", r.get("stock_presence", "All")),
         "profit_loss": st.session_state.get(f"rule_profit_loss_{rid}", r.get("profit_loss", "")),
         "pl_comp": st.session_state.get(f"rule_pl_comp_{rid}", r.get("pl_comp", "")),
         "pl_from": st.session_state.get(f"rule_pl_from_{rid}", r.get("pl_from", 0.0)),
         "pl_to": st.session_state.get(f"rule_pl_to_{rid}", r.get("pl_to", 0.0)),
+        "pl_basis": st.session_state.get(f"rule_pl_basis_{rid}", r.get("pl_basis", "Per Portfolio")),  # NEW
         "inv_comp": st.session_state.get(f"rule_inv_comp_{rid}", r.get("inv_comp", "")),
         "inv_from": st.session_state.get(f"rule_inv_from_{rid}", r.get("inv_from", 0.0)),
         "inv_to": st.session_state.get(f"rule_inv_to_{rid}", r.get("inv_to", 0.0)),
@@ -429,6 +457,7 @@ def render_alerts_tab(valid_dfs):
                     horizontal=True,
                     key="alerts_view_mode"
                 )
+
                 if mode == "By Portfolio":
                     port = st.selectbox(
                         "Select Portfolio",
@@ -436,16 +465,46 @@ def render_alerts_tab(valid_dfs):
                         key="alerts_port_pick"
                     )
                     subset = alerts_df[alerts_df["portfolio"] == port]
+                    empty_msg_shown = False
                 else:
-                    rule = st.selectbox(
+                    # Build full list of rule names (even if no alerts fired)
+                    all_rule_names = []
+                    name_to_id = {}
+                    for r in ss.alert_rules:
+                        nm = (r.get("name") or "").strip() or f"Rule {r.get('id')}"
+                        # Disambiguate duplicate names by appending ID
+                        if nm in name_to_id:
+                            nm = f"{nm} (ID {r.get('id')})"
+                        name_to_id[nm] = r.get("id")
+                        all_rule_names.append(nm)
+
+                    rule_choice = st.selectbox(
                         "Select Rule",
-                        sorted(alerts_df["rule"].unique()),
+                        all_rule_names,
                         key="alerts_rule_pick"
                     )
-                    subset = alerts_df[alerts_df["rule"] == rule]
 
-                if subset.empty:
+                    # The alerts_df uses the stored rule_name (same logic as generate_alerts: name or fallback)
+                    # Reconstruct the canonical name used in alerts_df for filtering:
+                    # Strip possible appended (ID ...) suffix
+                    base_rule_name = rule_choice
+                    if base_rule_name.endswith(")"):
+                        # try to remove " (ID n)" if present
+                        parts = base_rule_name.rsplit(" (ID ", 1)
+                        if len(parts) == 2 and parts[1].endswith(")"):
+                            base_rule_name = parts[0]
+
+                    subset = alerts_df[alerts_df["rule"] == base_rule_name]
+                    empty_msg_shown = False
+                    if subset.empty:
+                        st.info("No alerts triggered yet for this rule.")
+                        empty_msg_shown = True
+
+                if subset.empty and not empty_msg_shown:
                     st.warning("No matches for selection.")
+                elif subset.empty and empty_msg_shown:
+                    # Do not attempt to render instruments section
+                    pass
                 else:
                     instruments = [
                         i for i in subset["instrument"].unique()
